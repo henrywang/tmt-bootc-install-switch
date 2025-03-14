@@ -1,0 +1,3 @@
+summary: Run bootc-switch test
+test: ./bootc-switch.sh
+duration: 1h

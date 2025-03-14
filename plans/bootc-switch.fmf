@@ -1,0 +1,10 @@
+summary: run bootc switch test on tmt image mode vm
+provision:
+  how: virtual
+  image: http://images.osci.redhat.com/RHEL-9.6.0-image-mode-x86_64.qcow2
+execute:
+  how: tmt
+discover:
+  how: fmf
+  test:
+    - /bootc-switch

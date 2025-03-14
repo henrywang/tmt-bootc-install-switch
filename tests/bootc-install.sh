@@ -27,9 +27,7 @@ if [ "$TMT_REBOOT_COUNT" -eq 0 ]; then
             ;;
     esac
 
-    ls -al /root/.ssh
-    cat /root/.ssh/authorized_keys
-    cp -r /root/.ssh "$TEMPDIR"
+    cp -r /var/tmp/tmt "$TEMPDIR"
 
     if [[ "$VERSION_ID" == "43" ]]; then
         BOOTC_COPR_REPO_DISTRO="fedora-rawhide-${ARCH}"
@@ -54,12 +52,14 @@ repo_gpgcheck=0
 EOF
 
 dnf -y update bootc
+# cloud-init and rsync are required by TMT
 dnf -y install cloud-init rsync
 ln -s ../cloud-init.target /usr/lib/systemd/system/default.target.wants
 dnf -y clean all
 rm -rf /var/cache /var/lib/dnf
 EORUN
-COPY .ssh /var/roothome/.ssh
+# Keep package mode /var/tmp/tmt folder in place after replace to image mode
+COPY tmt /var/tmp/tmt
 REALEOF
 
     cat "$CONTAINERFILE"

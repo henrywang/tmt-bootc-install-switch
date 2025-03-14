@@ -1,0 +1,14 @@
+summary: run bootc install to-existing-root test on tmt vm
+provision:
+  how: virtual
+  image: https://dl.fedoraproject.org/pub/fedora/linux/releases/41/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-41-1.4.x86_64.qcow2
+prepare:
+  - how: install
+    package:
+      - podman
+execute:
+  how: tmt
+discover:
+  how: fmf
+  test:
+    - /bootc-install

@@ -1,0 +1,3 @@
+summary: Run bootc-install test
+test: ./bootc-install.sh
+duration: 1h

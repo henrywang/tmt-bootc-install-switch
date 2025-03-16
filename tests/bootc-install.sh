@@ -7,6 +7,7 @@ if [ "$TMT_REBOOT_COUNT" -eq 0 ]; then
     trap 'rm -rf -- "$TEMPDIR"' EXIT
 
     echo "$PATH"
+    printenv
     which tmt-reboot
     ls -al /usr/local/bin
 
@@ -31,7 +32,14 @@ if [ "$TMT_REBOOT_COUNT" -eq 0 ]; then
             ;;
     esac
 
-    cp -r /var/tmp/tmt "$TEMPDIR"
+    # Running on Testing Farm
+    if [[ -d "/var/ARTIFACTS" ]]; then
+        cp -r /var/ARTIFACTS "$TEMPDIR"
+    # Running on local machine with tmt run
+    else
+        cp -r /var/tmp/tmt "$TEMPDIR"
+    fi
+
     cp -r /usr/local/bin "$TEMPDIR"
 
     if [[ "$VERSION_ID" == "43" ]]; then
@@ -61,11 +69,17 @@ ln -s ../cloud-init.target /usr/lib/systemd/system/default.target.wants
 dnf -y clean all
 rm -rf /var/cache /var/lib/dnf
 EORUN
-# Keep package mode /var/tmp/tmt folder in place after replace to image mode
-COPY tmt /var/tmp/tmt
 # Some rhts-*, rstrnt-* and tmt-* commands are in /usr/local/bin
 COPY bin /usr/local/bin
 REALEOF
+
+    if [[ -d "/var/ARTIFACTS" ]]; then
+        # TMT work dir /var/ARTIFACTS should be reserved
+        echo "COPY ARTIFACTS /var/ARTIFACTS" >> "$CONTAINERFILE"
+    else
+        # TMT work dir /var/tmp/tmt should be reserved
+        echo "COPY tmt /var/tmp/tmt" >> "$CONTAINERFILE"
+    fi
 
     cat "$CONTAINERFILE"
     sudo podman build --tls-verify=false -t localhost/bootc:tmt -f "$CONTAINERFILE" "$TEMPDIR"
@@ -87,7 +101,12 @@ REALEOF
 elif [ "$TMT_REBOOT_COUNT" -eq 1 ]; then
     bootc status
     echo "$PATH"
-    ls -al /var/tmp/tmt
+    printenv
+    if [[ -d "/var/ARTIFACTS" ]]; then
+        ls -al /var/ARTIFACTS
+    else
+        ls -al /var/tmp/tmt
+    fi
     ls -al /usr/local/bin
     echo "bootc install to-existing-root succeed"
     exit 0

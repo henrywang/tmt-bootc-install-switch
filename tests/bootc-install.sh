@@ -6,6 +6,10 @@ if [ "$TMT_REBOOT_COUNT" -eq 0 ]; then
     TEMPDIR=$(mktemp -d)
     trap 'rm -rf -- "$TEMPDIR"' EXIT
 
+    echo "$PATH"
+    which tmt-reboot
+    ls -al /usr/local/bin
+
     # Get OS data.
     source /etc/os-release
     case ""${ID}-${VERSION_ID}"" in
@@ -28,6 +32,7 @@ if [ "$TMT_REBOOT_COUNT" -eq 0 ]; then
     esac
 
     cp -r /var/tmp/tmt "$TEMPDIR"
+    cp -r /usr/local/bin "$TEMPDIR"
 
     if [[ "$VERSION_ID" == "43" ]]; then
         BOOTC_COPR_REPO_DISTRO="fedora-rawhide-${ARCH}"
@@ -39,8 +44,6 @@ FROM $TIER1_IMAGE_URL
 
 RUN <<EORUN
 set -xeuo pipefail
-
-mkdir -p -m 0700 /var/roothome
 
 cat <<EOF >> /etc/yum.repos.d/bootc.repo
 [bootc]
@@ -60,6 +63,8 @@ rm -rf /var/cache /var/lib/dnf
 EORUN
 # Keep package mode /var/tmp/tmt folder in place after replace to image mode
 COPY tmt /var/tmp/tmt
+# Some rhts-*, rstrnt-* and tmt-* commands are in /usr/local/bin
+COPY bin /usr/local/bin
 REALEOF
 
     cat "$CONTAINERFILE"
@@ -81,6 +86,9 @@ REALEOF
     tmt-reboot
 elif [ "$TMT_REBOOT_COUNT" -eq 1 ]; then
     bootc status
+    echo "$PATH"
+    ls -al /var/tmp/tmt
+    ls -al /usr/local/bin
     echo "bootc install to-existing-root succeed"
     exit 0
 fi

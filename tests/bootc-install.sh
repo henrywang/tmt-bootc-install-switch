@@ -66,6 +66,11 @@ gpgcheck=0
 repo_gpgcheck=0
 EOF
 
+mkdir -p /usr/lib/bootc/kargs.d/
+cat <<KARGEOF >> /usr/lib/bootc/kargs.d/20-console.toml
+kargs = ["console=ttyS0,115200n8"]
+KARGEOF
+
 dnf -y update bootc
 # cloud-init and rsync are required by TMT
 dnf -y install cloud-init rsync

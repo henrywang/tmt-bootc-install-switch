@@ -35,6 +35,7 @@ if [ "$TMT_REBOOT_COUNT" -eq 0 ]; then
     # Running on Testing Farm
     if [[ -d "/var/ARTIFACTS" ]]; then
         cp -r /var/ARTIFACTS "$TEMPDIR"
+        cp -r /root/.ssh "$TEMPDIR"
     # Running on local machine with tmt run
     else
         cp -r /var/tmp/tmt "$TEMPDIR"
@@ -52,6 +53,9 @@ FROM $TIER1_IMAGE_URL
 
 RUN <<EORUN
 set -xeuo pipefail
+
+# For testing farm
+mkdir -p -m 0700 /var/roothome
 
 cat <<EOF >> /etc/yum.repos.d/bootc.repo
 [bootc]
@@ -74,10 +78,12 @@ COPY bin /usr/local/bin
 REALEOF
 
     if [[ -d "/var/ARTIFACTS" ]]; then
-        # TMT work dir /var/ARTIFACTS should be reserved
+        # In Testing Farm, TMT work dir /var/ARTIFACTS should be reserved
         echo "COPY ARTIFACTS /var/ARTIFACTS" >> "$CONTAINERFILE"
+        # In Testing Farm, all ssh things should be reserved for ssh command run after reboot
+        echo "COPY .ssh /var/roothome/.ssh" >> "$CONTAINERFILE"
     else
-        # TMT work dir /var/tmp/tmt should be reserved
+        # In local machine, TMT work dir /var/tmp/tmt should be reserved
         echo "COPY tmt /var/tmp/tmt" >> "$CONTAINERFILE"
     fi
 

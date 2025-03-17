@@ -1,0 +1,3 @@
+summary: Run upgrade test
+test: ./upgrade.sh
+duration: 1h

@@ -1,0 +1,3 @@
+summary: Run replace to image mode test
+test: ./replace.sh
+duration: 1h

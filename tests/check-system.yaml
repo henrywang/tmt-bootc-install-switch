@@ -1,0 +1,910 @@
+---
+- hosts: guest
+  become: false
+  vars:
+    test_os: ""
+    rhc_ak: "{{ lookup('env', 'RHC_AK') | default('', true) }}"
+    rhc_orgid: "{{ lookup('env', 'RHC_ORGID') | default('', true) }}"
+    bootc_image: ""
+    upgrade: ""
+    fips: "disabled"
+    bootc_kargs_lbi: "disabled"
+    running_on_tmt: "false"
+    total_counter: "0"
+    failed_counter: "0"
+
+  tasks:
+    # current target host's IP address
+    - debug: var=ansible_all_ipv4_addresses
+    - debug: var=ansible_facts['distribution_version']
+    - debug: var=ansible_facts['distribution']
+    - debug: var=ansible_facts['architecture']
+
+    - name: check bios or uefi
+      stat:
+        path: /sys/firmware/efi
+
+    - name: check secure boot status
+      command: mokutil --sb-state
+      ignore_errors: true
+
+    - name: check tpm device
+      stat:
+        path: /dev/tpm0
+      ignore_errors: true
+
+    - name: check partition size
+      command: df -Th
+      ignore_errors: true
+      become: true
+
+    - name: check disk partition table
+      command: fdisk -l
+      ignore_errors: true
+      become: true
+
+    - name: list block device
+      command: lsblk -af
+      ignore_errors: true
+      become: true
+
+    - name: check mount table
+      command: findmnt
+      ignore_errors: true
+
+    - name: check kernel version
+      command: uname -r
+      ignore_errors: true
+
+    - name: check rpm-ostree status
+      command: rpm-ostree status
+      ignore_errors: true
+
+    - name: check bootc status
+      command: bootc status
+      ignore_errors: true
+      become: true
+
+    - name: check ostree finalize staged log
+      command: journalctl -b -1 -u ostree-finalize-staged.service
+      ignore_errors: true
+      become: true
+
+    # case: check installed container image
+    - name: get installed container image
+      shell: bootc status --json | jq -r '.status.booted.image.image.image'
+      register: result_bootc_status
+      become: true
+
+    - set_fact:
+        installed_image: "{{ result_bootc_status.stdout }}"
+
+    - name: check commit deployed and built
+      block:
+        - assert:
+            that:
+              - installed_image == bootc_image
+            fail_msg: "{{ bootc_image }} IS NOT installed"
+            success_msg: "{{ bootc_image }} installed"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when: "'localhost' not in installed_image"
+
+    # case: check ostree-remount service status
+    - name: check ostree-remount service status
+      command: systemctl is-active ostree-remount.service
+      register: result_remount
+
+    - name: ostree-remount should be started
+      block:
+        - assert:
+            that:
+              - result_remount.stdout == "active"
+            fail_msg: "ostree-remount is not started by default"
+            success_msg: "starting ostree-remount successful"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    - name: set mount point device name
+      command: findmnt -r -v -o SOURCE -n /sysroot
+      register: result_sysroot_source
+
+    - set_fact:
+        device_name: "{{ result_sysroot_source.stdout }}"
+
+    - name: get filesystem type
+      shell: df --output=fstype -v /sysroot | grep -v Type
+      register: result_fstype
+
+    - set_fact:
+        fstype: "{{ result_fstype.stdout }}"
+
+    - name: get ostree osname
+      shell: rpm-ostree status --json | jq -r '.deployments[0].osname'
+      register: result_osname
+
+    - set_fact:
+        osname: "{{ result_osname.stdout }}"
+
+    - name: get ostree checksum
+      shell: bootc status --json | jq -r '.status.booted.ostree.checksum'
+      register: result_ostree_checksum
+      become: true
+
+    - set_fact:
+        ostree_checksum: "{{ result_ostree_checksum.stdout }}"
+
+    # case: check /sysroot mount status
+    - name: check /sysroot mount status
+      shell: findmnt -r -o OPTIONS -n /sysroot | awk -F "," '{print $1}'
+      register: result_sysroot_mount_status
+
+    - name: get podman version
+      shell: rpm -q --queryformat='%{VERSION}' podman
+      register: result_podman_version
+
+    - set_fact:
+        podman_version: "{{ result_podman_version.stdout }}"
+
+    - name: /sysroot should be mount with ro permission
+      block:
+        - assert:
+            that:
+              - result_sysroot_mount_status.stdout == "ro"
+            fail_msg: "/sysroot is not mounted with ro permission"
+            success_msg: "/sysroot is mounted with ro permission"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    # case: check /var mount point
+    - name: check /var mount point
+      command: findmnt -r -o SOURCE -n /var
+      register: result_var_mount_point
+
+    - name: /var mount point checking
+      block:
+        - assert:
+            that:
+              - result_var_mount_point.stdout == var_mount_path
+            fail_msg: "/var does not mount on {{ var_mount_path }}"
+            success_msg: "/var mounts on {{ var_mount_path }}"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      vars:
+        var_mount_path: "{{ device_name }}[/ostree/deploy/{{ osname }}/var]"
+      when: fstype != "btrfs"
+
+    # btrfs defines subvolume /root in fedora
+    # but for bootc install to-disk will set btrfs subvolume /
+    - name: /var mount point checking - btrfs
+      block:
+        - assert:
+            that:
+              - result_var_mount_point.stdout == var_mount_path_1 or result_var_mount_point.stdout == var_mount_path_2
+            fail_msg: "/var does not mount on {{ var_mount_path_1 }} or {{ var_mount_path_2 }}"
+            success_msg: "/var mounts on {{ var_mount_path_1 }} or {{ var_mount_path_2 }}"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      vars:
+        var_mount_path_1: "{{ device_name }}[/root/ostree/deploy/{{ osname }}/var]"
+        var_mount_path_2: "{{ device_name }}[/ostree/deploy/{{ osname }}/var]"
+      when: fstype == "btrfs"
+
+    # case: check /var mount status
+    - name: check /var mount status
+      shell: findmnt -r -o OPTIONS -n /var | awk -F "," '{print $1}'
+      register: result_var_mount_status
+
+    - name: /var should be mount with rw permission
+      block:
+        - assert:
+            that:
+              - result_var_mount_status.stdout == "rw"
+            fail_msg: "/var is not mounted with rw permission"
+            success_msg: "/var is mounted with rw permission"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    # case: check / mount point
+    # workaround issue https://gitlab.com/redhat/centos-stream/containers/bootc/-/issues/301 to allow none as SOURCE
+    - name: check / mount point
+      command: findmnt -r -o SOURCE -n /
+      register: result_root_mount_point
+
+    # overlay: as default
+    # none: workaround issue https://gitlab.com/redhat/centos-stream/containers/bootc/-/issues/301
+    # composefs: issue has been fixed by https://github.com/containers/composefs/pull/303
+    - name: / mount point checking
+      block:
+        - assert:
+            that:
+              - result_root_mount_point.stdout == "overlay" or result_root_mount_point.stdout == "none" or result_root_mount_point.stdout == "composefs"
+            fail_msg: "/ does not mount with overlay or none"
+            success_msg: "/ mounts with overlay"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    - name: get root partition path
+      shell: findmnt -vno SOURCE /sysroot
+      register: root_partition_path
+      ignore_errors: true
+
+    - name: check growfs
+      block:
+        - name: get root device name
+          shell: lsblk -no pkname /dev/`basename {{ root_partition_path.stdout }}`
+          register: root_device_name
+
+        - name: get root partition size
+          shell: df -h /sysroot | awk 'NR==2{print $2}'
+          register: root_partition_size
+
+        - name: get root disk size
+          shell: lsblk -l /dev/{{ root_device_name.stdout }} | grep -w ^{{ root_device_name.stdout }} | awk '{print $4}'
+          register: root_disk_size
+
+        - set_fact:
+            root_percentage: "{{ (root_partition_size.stdout | regex_replace('([A-Z])$', '') | float) * 100 / (root_disk_size.stdout | regex_replace('([A-Z])$', '') | float) }}"
+
+        - assert:
+            that:
+              - root_percentage | int >= 70
+            fail_msg: "{{ root_partition_size.stdout }} IS NOT installed"
+            success_msg: "{{ root_partition_size.stdout }}/{{ root_disk_size.stdout }} = {{ root_percentage }} >= 70%"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when: "'/dev/mapper/' not in root_partition_path.stdout and '/dev/' in root_partition_path.stdout"
+
+    - name: check VERSION_ID in /etc/os-release
+      shell: awk -F '=' '/^VERSION_ID/ {print $2}' /etc/os-release | tr -d '"'
+      register: result_os_release_version_id
+
+    - name: redhat.version-id == VERSION_ID
+      block:
+        - assert:
+            that:
+              - image_label_version_id == result_os_release_version_id.stdout
+            fail_msg: "version_id in label != version_id in /etc/os-release"
+            success_msg: "version_id in label == version_id in /etc/os-release"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    - name: check selinux status
+      shell: getenforce
+      register: result_selinux
+
+    - name: selinux is Enforcing
+      block:
+        - assert:
+            that:
+              - result_selinux.stdout == "Enforcing"
+            fail_msg: "SELinux status is not Enforcing"
+            success_msg: "SELinux is Enforcing"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    - name: check bootc-fetch-apply-updates.timer left time
+      shell: systemctl list-timers bootc-fetch-apply-updates.timer --output json | jq -r '.[].left'
+      register: result_bootc_timer_left
+
+    - name: check bootc-fetch-apply-updates.timer left time greater than 0
+      block:
+        - assert:
+            that:
+              - result_bootc_timer_left.stdout | int > 0
+            fail_msg: "bootc-fetch-apply-updates.timer won't be triggered"
+            success_msg: "bootc-fetch-apply-updates.timer is good"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    - name: check installed package
+      shell: rpm -qa | sort
+      register: result_packages
+
+    - name: upgrade checking
+      block:
+        # case: check booted ostree chacksum != rollback ostree checksum
+        - name: get rollback ostree checksum
+          shell: bootc status --json | jq -r '.status.rollback.ostree.checksum'
+          register: result_rollback_ostree_checksum
+          become: true
+
+        - name: check booted and rollback ostree chacksum
+          block:
+            - assert:
+                that:
+                  - ostree_checksum != result_rollback_ostree_checksum.stdout
+                fail_msg: "upgrade failed"
+                success_msg: "upgrade passed"
+          always:
+            - set_fact:
+                total_counter: "{{ total_counter | int + 1 }}"
+          rescue:
+            - name: failed count + 1
+              set_fact:
+                failed_counter: "{{ failed_counter | int + 1 }}"
+        - set_fact:
+            ostree_checksum: "{{ result_ostree_checksum.stdout }}"
+
+        # case: check wget installed after upgrade
+        - name: check wget installed
+          block:
+            - assert:
+                that:
+                  - "'wget' in result_packages.stdout"
+                fail_msg: "wget not installed, ostree upgrade might be failed"
+                success_msg: "wget installed in ostree upgrade"
+          always:
+            - set_fact:
+                total_counter: "{{ total_counter | int + 1 }}"
+          rescue:
+            - name: failed count + 1
+              set_fact:
+                failed_counter: "{{ failed_counter | int + 1 }}"
+      when: upgrade == "true"
+
+    - name: check qemu-guest-agent installed
+      block:
+        - assert:
+            that:
+              - "'qemu-guest-agent' in result_packages.stdout"
+            fail_msg: "qemu-guest-agent not installed, layered image error"
+            success_msg: "qemu-guest-agent installed in layered image"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - layered_image | default('') == "qemu-guest-agent"
+
+    - name: check nvidia-driver in nvidia derived image
+      block:
+        - name: run nvidia-smi
+          command: nvidia-smi -L
+          register: nvidia_smi_result
+          become: true
+
+        - assert:
+            that:
+              - nvidia_smi_result is succeeded
+              - "'GPU 0: NVIDIA A10G' in nvidia_smi_result.stdout"
+            fail_msg: "nvidia-smi -L != GPU NVIDIA A10G in nvidia derived image"
+            success_msg: "nvidia-smi -L = GPU NVIDIA A10G in nvidia derived image"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - layered_image | default('') == "nvidia"
+
+    - name: check nvidia-container-toolkit in nvidia derived image
+      block:
+        - name: run nvidia-ctk cdi generate
+          command: nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+          become: true
+
+        - name: run nvidia-ctk cdi list
+          command: nvidia-ctk cdi list
+          become: true
+
+        - name: run nvidia-smi in container
+          command: podman run --rm --device nvidia.com/gpu=all --security-opt=label=disable quay.io/centos/centos:stream9 nvidia-smi -L
+          register: nvidia_smi_container_result
+          become: true
+
+        - assert:
+            that:
+              - nvidia_smi_container_result is succeeded
+              - "'GPU 0: NVIDIA A10G' in nvidia_smi_container_result.stdout"
+            fail_msg: "podman run nvidia-smi -L != GPU NVIDIA A10G in nvidia derived image"
+            success_msg: "podman run nvidia-smi -L = GPU NVIDIA A10G in nvidia derived image"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - layered_image | default('') == "nvidia"
+
+    - name: check open-vm-tools
+      block:
+        - name: check open-vm-tools service status
+          command: systemctl is-active vmtoolsd
+          register: result_vmtoolsd
+
+        - assert:
+            that:
+              - result_vmtoolsd.stdout == "active"
+            fail_msg: "vmtoolsd is not started by default"
+            success_msg: "starting vmtoolsd successful"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - layered_image | default('') == "vmware"
+
+    # case: check dmesg error and failed log
+    - name: check dmesg output
+      command: dmesg
+      become: true
+
+    - name: check dmesg error and fail log
+      shell: dmesg --notime | grep -i "error\|fail" | grep -v "skipped" | grep -v "failover" | grep -v "ignition" | grep -v "Driver 'pcspkr'" || true
+      register: result_dmesg_error
+      become: true
+
+    - name: check journal error and fail log
+      shell: journalctl | grep -i "error\|fail" | grep -v "skipped" | grep -v "failover" | grep -v "ignition" | grep -v "Driver 'pcspkr'" || true
+      register: result_journalctl_error
+      become: true
+
+    - name: get kexec-tools version
+      shell: rpm -q --queryformat='%{VERSION}' kexec-tools
+      register: result_kexec_tools_version
+
+    - set_fact:
+        kexec_tools_version: "{{ result_kexec_tools_version.stdout }}"
+
+    - name: check kdump status
+      command: systemctl is-enabled kdump
+      register: kdump_enabled
+      ignore_errors: true
+
+    - name: check crashkernel param
+      command: grep crashkernel= /proc/cmdline
+      register: crashkernel_result
+      ignore_errors: true
+
+    - name: check kdump service status
+      command: systemctl is-active kdump
+      register: kdump_active
+      become: true
+      retries: 12
+      delay: 5
+      until: kdump_active.stdout == "active"
+      ignore_errors: true
+      # FIXME: https://issues.redhat.com/browse/RHEL-35885
+      when:
+        - kdump_enabled.stdout == "enabled"
+        - crashkernel_result is success
+        - kexec_tools_version is version('2.0.27', '!=')
+        - kexec_tools_version is version('2.0.29', '!=')
+
+    - name: kdump should be started
+      block:
+        - assert:
+            that:
+              - kdump_active.stdout == "active"
+              # - kdump_status.stdout == "activating"
+            fail_msg: "kdump is not started by default"
+            success_msg: "starting kdump successful"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      # FIXME: https://issues.redhat.com/browse/RHEL-50736
+      when:
+        - kdump_enabled.stdout == "enabled"
+        - crashkernel_result is success
+        - ansible_distribution_major_version | int != 10
+        - kexec_tools_version is version('2.0.27', '!=')
+        - kexec_tools_version is version('2.0.29', '!=')
+
+    # case: check running container with podman in root
+    - name: run CentOS Stream 9 image with podman in root
+      command: podman run --rm quay.io/centos/centos:stream9 cat /etc/redhat-release
+      register: podman_result
+      become: true
+      retries: 30
+      delay: 2
+      until: podman_result is success
+      ignore_errors: true
+
+    - name: run container test
+      block:
+        - assert:
+            that:
+              - podman_result is succeeded
+              - "'CentOS Stream release 9' in podman_result.stdout"
+            fail_msg: "failed run container with podman (root)"
+            success_msg: "running container with podman (root) succeeded"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    - name: workaround for https://github.com/containers/podman/issues/23515
+      command: mkdir -p /home/{{ ansible_user }}/.local/share/containers/storage/volumes
+      ignore_errors: true
+      when: podman_version is version('5.2.0', '==') or podman_version is version('5.2.1', '==')
+
+    # case: check running container with podman in rootless
+    - name: run CentOS Stream 9 image with in rootless
+      command: podman run --rm quay.io/centos/centos:stream9 cat /etc/redhat-release
+      register: podman_result
+      retries: 30
+      delay: 2
+      until: podman_result is success
+      ignore_errors: true
+
+    - name: run container test
+      block:
+        - assert:
+            that:
+              - podman_result is succeeded
+              - "'CentOS Stream release 9' in podman_result.stdout"
+            fail_msg: "failed run container with podman (non-root)"
+            success_msg: "running container with podman (non-root) succeeded"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+
+    - name: get selinux-policy version
+      shell: rpm -q --queryformat='%{VERSION}' selinux-policy
+      register: result_selinux_policy_version
+
+    - set_fact:
+        selinux_policy_version: "{{ result_selinux_policy_version.stdout }}"
+
+    - name: rhc check
+      block:
+        - name: run rhc connect
+          command: rhc connect --activation-key {{ rhc_ak }} --organization {{ rhc_orgid }}
+          register: rhc_result
+          become: true
+          retries: 3
+          delay: 3
+          until: rhc_result is success
+
+        - name: run rhc status
+          command: rhc status
+          register: rhc_status_result
+          become: true
+          until:
+            - not rhc_status_result.stdout_lines is search("inactive")
+            - not rhc_status_result.stdout_lines is search("Not connected")
+          retries: 3
+          delay: 3
+          ignore_errors: true
+
+        # - assert:
+        #     that:
+        #       - rhc_status_result is succeeded
+        #       - "'Connected to Red Hat Subscription Management' in rhc_status_result.stdout"
+        #       - "'Connected to Red Hat Insights' in rhc_status_result.stdout"
+        #       - "'The Remote Host Configuration daemon is active' in rhc_status_result.stdout"
+        #     fail_msg: "rhc status is not expected"
+        #     success_msg: "rhc status is good"
+
+        - name: check rhcd journal log
+          command: journalctl -u rhcd
+          become: true
+          ignore_errors: true
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - "'rhel' in test_os"
+        - ansible_distribution_major_version | int != 10
+
+    # case: kernel FIPS flag test
+    - name: check kernel FIPS flag
+      block:
+        - name: get kernel FIPS flag
+          command: cat /proc/sys/crypto/fips_enabled
+          register: fips_kernel_enabled
+
+        - name: check kernel FIPS flag output
+          assert:
+            that:
+              - "'1' in fips_kernel_enabled.stdout"
+            fail_msg: "FIPS mode not enabled"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - fips == "enabled"
+
+    # case: crypto-policy base policy test
+    - name: check crypto-policy base policy
+      block:
+        - name: get crypto-policy base policy
+          shell: "cat /etc/crypto-policies/state/current | cut -f 1 -d :"
+          register: base_policy_is_fips
+
+        - name: check crypto-policy base policy output
+          assert:
+            that:
+              - "'FIPS' in base_policy_is_fips.stdout"
+            fail_msg: "crypto-policy base policy is not FIPS"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - fips == "enabled"
+
+    # case: FIPS karg test
+    - name: check karg fips=1
+      block:
+        - name: run 'cat /proc/cmdline'
+          command: cat /proc/cmdline
+          register: fips_karg
+          become: true
+
+        - name: check 'cat /proc/cmdline' output
+          assert:
+            that:
+              - "'fips=1' in fips_karg.stdout"
+            fail_msg: "fips=1 can't be found in karg"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - fips == "enabled"
+
+    # case: FIPS crypto policy test
+    - name: check crypto policy
+      block:
+        - name: run 'update-crypto-policies --show'
+          command: update-crypto-policies --show
+          register: crypto_policy
+          become: true
+
+        - name: check 'update-crypto-policies --show' output
+          assert:
+            that:
+              - "'FIPS' in crypto_policy.stdout"
+            fail_msg: "Crypto policy is not FIPS"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - fips == "enabled"
+
+    # case: FIPS module in initramfs test
+    - name: check fips module in initramfs
+      block:
+        - name: run 'lsinitrd'
+          shell: lsinitrd -m
+          register: lsinitrd
+          become: true
+
+        - name: check 'lsinitrd' output
+          assert:
+            that:
+              - "'fips' in lsinitrd.stdout"
+            fail_msg: "fips module can't be found in initramfs"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - fips == "enabled"
+
+    - name: get bootc version
+      shell: rpm -q --queryformat='%{VERSION}' bootc
+      become: true
+      register: result_bootc_version
+
+    - set_fact:
+        bootc_version: "{{ result_bootc_version.stdout }}"
+
+    # case: check bootc anaconda kargs
+    - name: check karg mitigations=auto,nosmt
+      block:
+        - name: run 'cat /proc/cmdline'
+          command: cat /proc/cmdline
+          register: result_kargs
+          become: true
+
+        - name: check 'cat /proc/cmdline' output
+          assert:
+            that:
+              - "'mitigations=auto,nosmt' in result_kargs.stdout"
+            fail_msg: "mitigations=auto,nosmt can't be found in kargs"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - bootc_kargs_lbi == "enabled"
+        - bootc_version is version('1.1.3', '>=')
+
+    # case: check bootc anaconda LBI
+    - name: check LBI
+      block:
+        - name: bootc actually populated the bootc storage with the LBI images
+          shell: podman --storage-opt=additionalimagestore=/usr/lib/bootc/storage images --format json | jq -r '.[].Names'
+          register: result_podman_images
+          become: true
+
+        - name: bootc itself knows how to list the LBI images in the bootc storage
+          command: bootc image list --type logical
+          register: result_bootc_image
+          become: true
+
+        - name: valildate images
+          assert:
+            that:
+              - item in result_podman_images.stdout
+              - item in result_bootc_image.stdout
+            fail_msg: "mitigations=auto,nosmt can't be found in kargs"
+          loop:
+            - "quay.io/curl/curl:latest"
+            - "quay.io/bootc-test/curl-base:latest"
+            - "registry.access.redhat.com/ubi9/podman:latest"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when:
+        - bootc_kargs_lbi == "enabled"
+        - bootc_version is version('1.1.3', '>=')
+
+    # case: check system reboot
+    # 20 minutes reboot timeout is for aws ec2 bare instance test
+    - name: check system reboot
+      block:
+        - name: check system reboot
+          reboot:
+            post_reboot_delay: 60
+            pre_reboot_delay: 60
+            reboot_timeout: 1800
+          become: true
+          ignore_errors: true
+
+        - name: wait for connection to become reachable/usable
+          wait_for_connection:
+            delay: 30
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      when: running_on_tmt == "false"
+
+    # case: check persistent log in system
+    - name: check journald persistent logging
+      block:
+        - name: list boots
+          shell: journalctl --list-boots -q
+          register: result_list_boots
+          become: true
+
+        - assert:
+            that:
+              - result_list_boots.stdout_lines | length > 1
+            fail_msg: "NO journald persistent logging configured"
+            success_msg: "journald persistent logging configured"
+      always:
+        - set_fact:
+            total_counter: "{{ total_counter | int + 1 }}"
+      rescue:
+        - name: failed count + 1
+          set_fact:
+            failed_counter: "{{ failed_counter | int + 1 }}"
+      # workaround c10s persistent log issue https://issues.redhat.com/browse/RHEL-56025
+      when:
+        - ansible_facts['distribution_version'] != "10"
+        - running_on_tmt == "false"
+
+    # case: check reboot times
+    - name: check reboot times
+      command: last reboot
+      ignore_errors: true
+      become: true
+      when: running_on_tmt == "false"
+
+    - assert:
+        that:
+          - failed_counter == "0"
+        fail_msg: "Run {{ total_counter }} tests, but {{ failed_counter }} of them failed"
+        success_msg: "Totally {{ total_counter }} test passed"
